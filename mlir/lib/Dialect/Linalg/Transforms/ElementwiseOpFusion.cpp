@@ -423,6 +423,9 @@ mlir::linalg::fuseElementwiseOps(RewriterBase &rewriter,
       consumer.getIteratorTypes(),
       /*doc=*/nullptr,
       /*library_call=*/nullptr);
+  // The fused op replaces the consumer, so it keeps the consumer's discardable
+  // attributes.
+  fusedOp->setDiscardableAttrs(consumer->getDiscardableAttrDictionary());
   if (!fusedOp.getShapesToLoopsMap()) {
     // Fused op has invalid indexing maps. Typically this means something is off
     // in the input, but going ahead here would result in verification errors.
@@ -817,6 +820,7 @@ static Operation *createExpandedGenericOp(
   Operation *fused = GenericOp::create(rewriter, linalgOp.getLoc(), resultTypes,
                                        expandedOpOperands, outputs,
                                        expandedOpIndexingMaps, iteratorTypes);
+  fused->setDiscardableAttrs(linalgOp->getDiscardableAttrDictionary());
 
   Region &fusedRegion = fused->getRegion(0);
   Region &originalRegion = linalgOp->getRegion(0);
@@ -1798,6 +1802,7 @@ GenericOp cloneToCollapsedOp<GenericOp>(RewriterBase &rewriter,
       rewriter, origOp.getLoc(), resultTypes, inputOperands, outputOperands,
       indexingMaps, iteratorTypes,
       [](OpBuilder &builder, Location loc, ValueRange args) {});
+  collapsedOp->setDiscardableAttrs(origOp->getDiscardableAttrDictionary());
   Block *origOpBlock = &origOp->getRegion(0).front();
   Block *collapsedOpBlock = &collapsedOp->getRegion(0).front();
   rewriter.mergeBlocks(origOpBlock, collapsedOpBlock,
@@ -2320,6 +2325,7 @@ public:
                             genericOp.getIteratorTypes(),
                             /*doc=*/nullptr,
                             /*library_call=*/nullptr);
+      fusedOp->setDiscardableAttrs(genericOp->getDiscardableAttrDictionary());
 
       // Map the block argument corresponding to the replaced argument with the
       // scalar constant.

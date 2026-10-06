@@ -1056,3 +1056,47 @@ module {
 // CHECK:         tensor.expand_shape
 // CHECK:         linalg.generic {{.*}}, iterator_types = ["parallel", "parallel", "parallel", "parallel", "parallel", "parallel", "reduction"]}
 // CHECK-SAME:     ins(%[[ARG0]], %[[FUSED]]#1 : tensor<1x1x2x1xf32>, tensor<4x1x1x1xf32>)
+
+// -----
+
+// The fused op keeps the consumer's discardable attributes.
+#map = affine_map<(d0) -> (d0)>
+// CHECK-LABEL: @fusion_keeps_consumer_attributes
+func.func @fusion_keeps_consumer_attributes(%arg0: tensor<8xf32>) -> tensor<8xf32> {
+  %0 = tensor.empty() : tensor<8xf32>
+  %1 = linalg.generic {indexing_maps = [#map, #map], iterator_types = ["parallel"]}
+      ins(%arg0 : tensor<8xf32>) outs(%0 : tensor<8xf32>) attrs = {test.producer} {
+    ^bb0(%in: f32, %out: f32):
+      %2 = arith.negf %in : f32
+      linalg.yield %2 : f32
+  } -> tensor<8xf32>
+  // CHECK: linalg.generic
+  // CHECK-SAME: test.consumer
+  // CHECK-NOT: test.producer
+  %3 = linalg.generic {indexing_maps = [#map, #map], iterator_types = ["parallel"]}
+      ins(%1 : tensor<8xf32>) outs(%0 : tensor<8xf32>) attrs = {test.consumer} {
+    ^bb0(%in: f32, %out: f32):
+      %4 = arith.mulf %in, %in : f32
+      linalg.yield %4 : f32
+  } -> tensor<8xf32>
+  return %3 : tensor<8xf32>
+}
+
+// -----
+
+// Folding a splat constant input keeps the op's discardable attributes.
+#map = affine_map<(d0) -> (d0)>
+// CHECK-LABEL: @splat_folding_keeps_attributes
+//       CHECK:   linalg.generic
+//  CHECK-SAME:     test.attr
+func.func @splat_folding_keeps_attributes(%arg0: tensor<8xf32>) -> tensor<8xf32> {
+  %cst = arith.constant dense<2.0> : tensor<8xf32>
+  %0 = tensor.empty() : tensor<8xf32>
+  %1 = linalg.generic {indexing_maps = [#map, #map, #map], iterator_types = ["parallel"]}
+      ins(%arg0, %cst : tensor<8xf32>, tensor<8xf32>) outs(%0 : tensor<8xf32>) attrs = {test.attr} {
+    ^bb0(%in: f32, %scale: f32, %out: f32):
+      %2 = arith.mulf %in, %scale : f32
+      linalg.yield %2 : f32
+  } -> tensor<8xf32>
+  return %1 : tensor<8xf32>
+}

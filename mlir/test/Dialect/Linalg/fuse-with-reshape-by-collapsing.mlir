@@ -933,3 +933,22 @@ func.func @partial_fuse_by_collapsing(%arg0: tensor<4x?x32x128x192xf16>, %arg1: 
 //       CHECK:   %[[COLLAPSED:.+]] = tensor.collapse_shape %[[EXPANDED]]
 //  CHECK-SAME:     tensor<4x128x192x?x32xf32> into tensor<512x192x?xf32>
 //       CHECK:   return %[[COLLAPSED]] : tensor<512x192x?xf32>
+
+// -----
+
+// The collapsed op keeps the original op's discardable attributes.
+#map = affine_map<(d0, d1) -> (d0, d1)>
+// CHECK-LABEL: @collapsing_keeps_attributes
+//       CHECK:   linalg.generic
+//  CHECK-SAME:     test.attr
+func.func @collapsing_keeps_attributes(%arg0: tensor<32xf32>) -> tensor<4x8xf32> {
+  %0 = tensor.expand_shape %arg0 [[0, 1]] output_shape [4, 8] : tensor<32xf32> into tensor<4x8xf32>
+  %1 = tensor.empty() : tensor<4x8xf32>
+  %2 = linalg.generic {indexing_maps = [#map, #map], iterator_types = ["parallel", "parallel"]}
+      ins(%0 : tensor<4x8xf32>) outs(%1 : tensor<4x8xf32>) attrs = {test.attr} {
+    ^bb0(%in: f32, %out: f32):
+      %3 = arith.negf %in : f32
+      linalg.yield %3 : f32
+  } -> tensor<4x8xf32>
+  return %2 : tensor<4x8xf32>
+}
