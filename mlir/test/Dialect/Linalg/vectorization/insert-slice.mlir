@@ -169,3 +169,29 @@ func.func private @insert_slice_dynamic_source_and_dest_dim(%source: tensor<?x3x
     transform.yield
   }
  }
+
+// -----
+
+// The source is inserted into dims 1 and 4 of the destination, so the dropped
+// unit dims are not all leading and the write needs a permutation map.
+
+func.func private @insert_slice_dropped_dims_not_leading(%source: tensor<3x4xf64>, %dest: tensor<1x3x1x1x4xf64>) -> tensor<1x3x1x1x4xf64> {
+  %res = tensor.insert_slice %source into %dest[0, 0, 0, 0, 0] [1, 3, 1, 1, 4] [1, 1, 1, 1, 1] : tensor<3x4xf64> into tensor<1x3x1x1x4xf64>
+  return %res : tensor<1x3x1x1x4xf64>
+}
+
+// CHECK: #[[$MAP:.*]] = affine_map<(d0, d1, d2, d3, d4) -> (d1, d4)>
+// CHECK-LABEL:   func.func private @insert_slice_dropped_dims_not_leading(
+// CHECK-SAME:      %[[SRC:.*]]: tensor<3x4xf64>,
+// CHECK-SAME:      %[[DEST:.*]]: tensor<1x3x1x1x4xf64>) -> tensor<1x3x1x1x4xf64> {
+// CHECK:           %[[READ:.*]] = vector.transfer_read %[[SRC]]{{.*}} {in_bounds = [true, true]} : tensor<3x4xf64>, vector<3x4xf64>
+// CHECK:           %[[RES:.*]] = vector.transfer_write %[[READ]], %[[DEST]]{{.*}} {in_bounds = [true, true], permutation_map = #[[$MAP]]} : vector<3x4xf64>, tensor<1x3x1x1x4xf64>
+// CHECK:           return %[[RES]] : tensor<1x3x1x1x4xf64>
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%arg0: !transform.any_op {transform.readonly}) {
+    %0 = transform.structured.match ops{["tensor.insert_slice"]} in %arg0 : (!transform.any_op) -> !transform.any_op
+    transform.structured.vectorize %0 : !transform.any_op
+    transform.yield
+  }
+}

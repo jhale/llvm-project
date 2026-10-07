@@ -1686,10 +1686,15 @@ static bool isMaskTriviallyFoldable(SmallVector<OpFoldResult> &maskSizes,
 ///
 /// Finally, `writeIndices` specifies the offsets to use. If empty, all indices
 /// are set to 0.
+///
+/// If `permutationMap` is set, it maps the dims of `dest` to those of
+/// `vecToStore`. Otherwise `vecToStore` is written into the trailing dims of
+/// `dest`. Masking is only supported for the latter.
 static Operation *
 createWriteOrMaskedWrite(OpBuilder &builder, Location loc, Value vecToStore,
                          Value dest, SmallVector<Value> writeIndices = {},
-                         bool useInBoundsInsteadOfMasking = false) {
+                         bool useInBoundsInsteadOfMasking = false,
+                         AffineMap permutationMap = {}) {
 
   ShapedType destType = cast<ShapedType>(dest.getType());
   int64_t destRank = destType.getRank();
@@ -1699,15 +1704,20 @@ createWriteOrMaskedWrite(OpBuilder &builder, Location loc, Value vecToStore,
   int64_t vecToStoreRank = vecToStoreType.getRank();
   auto vecToStoreShape = vecToStoreType.getShape();
 
+  // The dim of `dest` that each dim of `vecToStore` is written into.
+  SmallVector<int64_t> destDims;
+  for (int64_t i = 0; i < vecToStoreRank; ++i)
+    destDims.push_back(permutationMap ? permutationMap.getDimPosition(i)
+                                      : destRank - vecToStoreRank + i);
+
   // Compute the in_bounds attribute
   SmallVector<bool> inBoundsVal(vecToStoreRank, true);
   if (useInBoundsInsteadOfMasking) {
     // Update the inBounds attribute.
     // FIXME: This computation is too weak - it ignores the write indices.
     for (unsigned i = 0; i < vecToStoreRank; i++)
-      inBoundsVal[i] =
-          (destShape[destRank - vecToStoreRank + i] >= vecToStoreShape[i]) &&
-          ShapedType::isStatic(destShape[destRank - vecToStoreRank + i]);
+      inBoundsVal[i] = (destShape[destDims[i]] >= vecToStoreShape[i]) &&
+                       ShapedType::isStatic(destShape[destDims[i]]);
   }
 
   // If missing, initialize the write indices to 0.
@@ -1720,15 +1730,25 @@ createWriteOrMaskedWrite(OpBuilder &builder, Location loc, Value vecToStore,
   }
 
   // Generate the xfer_write Op
-  Operation *write = vector::TransferWriteOp::create(builder, loc,
-                                                     /*vector=*/vecToStore,
-                                                     /*source=*/dest,
-                                                     /*indices=*/writeIndices,
-                                                     /*inBounds=*/inBoundsVal);
+  Operation *write =
+      permutationMap
+          ? vector::TransferWriteOp::create(builder, loc,
+                                            /*vector=*/vecToStore,
+                                            /*source=*/dest,
+                                            /*indices=*/writeIndices,
+                                            /*permutationMap=*/permutationMap,
+                                            /*inBounds=*/inBoundsVal)
+          : vector::TransferWriteOp::create(builder, loc,
+                                            /*vector=*/vecToStore,
+                                            /*source=*/dest,
+                                            /*indices=*/writeIndices,
+                                            /*inBounds=*/inBoundsVal);
 
   // If masking is disabled, exit.
   if (useInBoundsInsteadOfMasking)
     return write;
+
+  assert(!permutationMap && "masked writes must use the trailing dims of dest");
 
   // Check if masking is needed. If not, exit.
   if (llvm::equal(vecToStoreShape, destShape.take_back(vecToStoreRank)))
@@ -2141,6 +2161,30 @@ vectorizeUnPackOpPrecondition(linalg::UnPackOp unpackOp,
   return success();
 }
 
+/// Returns the dims of the destination of `sliceOp` that its source is
+/// inserted into, one per source dim. For a rank-expanding insert_slice, the
+/// dropped dims need not be the leading ones.
+static SmallVector<int64_t> getInsertedDims(tensor::InsertSliceOp sliceOp) {
+  llvm::SmallBitVector droppedDims = sliceOp.getDroppedDims();
+  SmallVector<int64_t> insertedDims;
+  for (int64_t dim = 0, end = sliceOp.getResultType().getRank(); dim < end;
+       ++dim)
+    if (!droppedDims[dim])
+      insertedDims.push_back(dim);
+  return insertedDims;
+}
+
+/// Returns true if `sliceOp` inserts its source into the trailing dims of its
+/// destination.
+static bool insertsIntoTrailingDims(tensor::InsertSliceOp sliceOp) {
+  SmallVector<int64_t> insertedDims = getInsertedDims(sliceOp);
+  int64_t rankDiff = sliceOp.getResultType().getRank() -
+                     sliceOp.getSourceType().getRank();
+  return llvm::all_of(llvm::enumerate(insertedDims), [&](auto dim) {
+    return dim.value() == rankDiff + static_cast<int64_t>(dim.index());
+  });
+}
+
 static LogicalResult
 vectorizeInsertSliceOpPrecondition(tensor::InsertSliceOp sliceOp,
                                    ArrayRef<int64_t> inputVectorSizes) {
@@ -2168,6 +2212,14 @@ vectorizeInsertSliceOpPrecondition(tensor::InsertSliceOp sliceOp,
 
   if (!padValue && isOutOfBoundsRead) {
     LDBG() << "Failed to get a pad value for out-of-bounds read access";
+    return failure();
+  }
+
+  // Masked writes assume that the source is inserted into the trailing dims
+  // of the destination.
+  if (!inputVectorSizes.empty() && !insertsIntoTrailingDims(sliceOp)) {
+    LDBG() << "Masked vectorization requires the source to be inserted into "
+              "the trailing dims of the destination";
     return failure();
   }
   return success();
@@ -3140,20 +3192,20 @@ vectorizeAsInsertSliceOp(RewriterBase &rewriter, tensor::InsertSliceOp sliceOp,
   }
 
   // 2. Get the vector shape
+  // For a rank-expanding insert_slice, the dropped dims need not be the
+  // leading ones, so each source dim is mapped to the dim it is inserted into.
+  SmallVector<int64_t> insertedDims = getInsertedDims(sliceOp);
   SmallVector<int64_t> vecShape;
-  size_t rankDiff = resultType.getRank() - sourceType.getRank();
   for (int64_t i = 0, end = sourceType.getRank(); i < end; ++i) {
     if (!inputVectorSizes.empty()) {
       vecShape.push_back(inputVectorSizes[i]);
     } else if (!sourceType.isDynamicDim(i)) {
       vecShape.push_back(sourceType.getDimSize(i));
-    } else if (!resultType.isDynamicDim(i)) {
+    } else if (!resultType.isDynamicDim(insertedDims[i])) {
       // Source shape is not statically known, but result shape is.
       // Vectorize with size of result shape. This may be larger than the
       // source size.
-      // FIXME: Using rankDiff implies that the source tensor is inserted at
-      // the end of the destination tensor. However, that's not required.
-      vecShape.push_back(resultType.getDimSize(rankDiff + i));
+      vecShape.push_back(resultType.getDimSize(insertedDims[i]));
     } else {
       // Neither source nor result dim of padOp is static. Cannot vectorize
       // the copy.
@@ -3172,12 +3224,21 @@ vectorizeAsInsertSliceOp(RewriterBase &rewriter, tensor::InsertSliceOp sliceOp,
       rewriter, loc, source, vecType, padValue,
       /*useInBoundsInsteadOfMasking=*/inputVectorSizes.empty());
 
-  // Create write
+  // Create write. Unless the source is inserted into the trailing dims of the
+  // destination, the write maps the inserted dims to the vector dims.
   auto writeIndices =
       getValueOrCreateConstantIndexOp(rewriter, loc, sliceOp.getMixedOffsets());
-  Operation *write =
-      createWriteOrMaskedWrite(rewriter, loc, read, sliceOp.getDest(),
-                               writeIndices, inputVectorSizes.empty());
+  AffineMap permutationMap;
+  if (!insertsIntoTrailingDims(sliceOp)) {
+    SmallVector<AffineExpr> exprs;
+    for (int64_t dim : insertedDims)
+      exprs.push_back(rewriter.getAffineDimExpr(dim));
+    permutationMap = AffineMap::get(resultType.getRank(), /*symbolCount=*/0,
+                                    exprs, rewriter.getContext());
+  }
+  Operation *write = createWriteOrMaskedWrite(
+      rewriter, loc, read, sliceOp.getDest(), writeIndices,
+      inputVectorSizes.empty(), permutationMap);
 
   // 4. Finalize
   newResults.push_back(write->getResult(0));

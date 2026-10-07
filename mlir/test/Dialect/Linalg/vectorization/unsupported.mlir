@@ -356,3 +356,22 @@ module attributes {transform.with_named_sequence} {
     transform.yield
   }
 }
+
+// -----
+
+// Masked writes assume that the source is inserted into the trailing dims of
+// the destination, which it is not here.
+
+func.func @insert_slice_masked_dropped_dims_not_leading(%source: tensor<3x4xf64>, %dest: tensor<1x3x1x1x4xf64>) -> tensor<1x3x1x1x4xf64> {
+  // expected-error @+1 {{Attempted to vectorize, but failed}}
+  %res = tensor.insert_slice %source into %dest[0, 0, 0, 0, 0] [1, 3, 1, 1, 4] [1, 1, 1, 1, 1] : tensor<3x4xf64> into tensor<1x3x1x1x4xf64>
+  return %res : tensor<1x3x1x1x4xf64>
+}
+
+module attributes {transform.with_named_sequence} {
+  transform.named_sequence @__transform_main(%arg0: !transform.any_op {transform.readonly}) {
+    %0 = transform.structured.match ops{["tensor.insert_slice"]} in %arg0 : (!transform.any_op) -> !transform.any_op
+    transform.structured.vectorize %0 vector_sizes [4, 4] : !transform.any_op
+    transform.yield
+  }
+}
